@@ -1,0 +1,27 @@
+{
+  "name": "laboratorio-seguridad-llm",
+  "version": "1.0.0",
+  "description": "Laboratorio educativo: Seguridad por Diseño en Arquitecturas LLM con Firebase y LangChain",
+  "type": "module",
+  "scripts": {
+    "setup": "node src/auth/createUsers.js",
+    "seed": "node src/seed/seed.js",
+    "demo": "node src/demo/runDemo.js",
+    "deploy:rules": "node scripts/deploy-rules.js"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/mistralai": "^0.1.0",
+    "chalk": "^5.3.0",
+    "dotenv": "^16.4.0",
+    "firebase": "^10.12.0",
+    "firebase-admin": "^12.3.0",
+    "langchain": "^0.3.0"
+  },
+  "devDependencies": {
+    "firebase-tools": "^13.12.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

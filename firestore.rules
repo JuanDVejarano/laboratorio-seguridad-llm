@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: lee el rol desde el custom claim del JWT del usuario autenticado.
+    // Los custom claims son asignados por el Admin SDK en createUsers.js y viajan
+    // firmados dentro del token — el cliente no puede falsificarlos.
+    function userRole() {
+      return request.auth.token.role;
+    }
+
+    // crm_ventas: accesible por los tres roles (datos comerciales, menor sensibilidad).
+    // El ejecutivo de ventas necesita ver su pipeline; cobranza y finanzas también
+    // requieren contexto comercial para su trabajo.
+    match /crm_ventas/{doc} {
+      allow read: if request.auth != null
+                  && userRole() in ['ejecutivo_ventas', 'gestor_cobranza', 'director_finanzas'];
+      allow write: if false; // El seed usa Admin SDK; escrituras desde cliente siempre denegadas
+    }
+
+    // crm_cobranza: solo cobranza y dirección financiera (datos de deuda, sensibilidad media).
+    // Un ejecutivo de ventas NO debe ver la deuda de sus clientes — podría afectar
+    // su relación comercial o generar conflictos de interés.
+    match /crm_cobranza/{doc} {
+      allow read: if request.auth != null
+                  && userRole() in ['gestor_cobranza', 'director_finanzas'];
+      allow write: if false;
+    }
+
+    // finanzas_internas: exclusivo de dirección financiera (costos y márgenes, alta sensibilidad).
+    // Esta colección contiene RUTs de proveedores, márgenes internos y condiciones
+    // de pago confidenciales. Exponerlos a otros roles sería una fuga de información
+    // estratégica que podría perjudicar a la empresa en negociaciones.
+    match /finanzas_internas/{doc} {
+      allow read: if request.auth != null
+                  && userRole() == 'director_finanzas';
+      allow write: if false;
+    }
+  }
+}
