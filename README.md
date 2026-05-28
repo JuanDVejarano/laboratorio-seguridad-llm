@@ -79,6 +79,44 @@ LLM_MODEL=mistral-large-latest
 
 ---
 
+## Capa de Observabilidad
+
+El proyecto usa dos capas de observabilidad complementarias:
+
+| Capa | Herramienta | Qué observa |
+|------|-------------|-------------|
+| LLM | LangSmith | Prompts enviados, respuestas del modelo, tokens, metadatos por rol |
+| Backend | Better Stack | Eventos del sistema, accesos denegados, PII detectada, correlation IDs |
+
+Ambas capas se conectan mediante el `correlation_id`: un UUID generado por escenario que aparece como campo en los logs de Better Stack y como `metadata.correlation_id` en las trazas de LangSmith.
+
+### Configurar LangSmith
+
+1. Crear cuenta gratuita en [smith.langchain.com](https://smith.langchain.com)
+2. Ir a **Settings → API Keys → Create API Key**
+3. Copiar el valor en `LANGCHAIN_API_KEY` del `.env`
+4. Definir un nombre de proyecto en `LANGCHAIN_PROJECT` (ej: `laboratorio-seguridad-llm`)
+5. Asegurarse de que `LANGCHAIN_TRACING_V2=true`
+
+Una vez configurado, cada ejecución de `npm run demo` genera trazas automáticamente en LangSmith. Para filtrar por escenario, usar el campo `metadata.rol` o `metadata.correlation_id`.
+
+### Configurar Better Stack
+
+1. Crear cuenta gratuita en [logs.betterstack.com](https://logs.betterstack.com)
+2. Ir a **Sources → Create source → Node.js**
+3. Copiar el **Source token** en `BETTERSTACK_SOURCE_TOKEN` del `.env`
+
+Los logs incluyen campos estructurados como `event`, `rol`, `coleccion`, `correlation_id`, `pii_counts`, `control_rbac`. Usar el buscador de Better Stack para filtrar por cualquiera de ellos.
+
+### Preguntas que la observabilidad puede responder
+
+Dado un `correlation_id` de cualquier escenario:
+- **¿Qué vio exactamente el LLM?** → LangSmith, filtrar por `metadata.correlation_id`
+- **¿Qué colecciones se leyeron y cuáles fueron denegadas?** → Better Stack, filtrar por `correlation_id` + `event = firestore.acceso_denegado`
+- **¿Hubo PII en la respuesta del LLM?** → Better Stack, filtrar por `event = llm.invocacion_completada` + `pii_en_respuesta.total > 0`
+
+---
+
 ## Instalación y ejecución
 
 ```bash

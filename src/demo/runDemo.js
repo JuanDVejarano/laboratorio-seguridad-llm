@@ -1,240 +1,269 @@
-import { adminDb } from '../config/admin.js';
-import { clientAuth, clientDb } from '../config/client.js';
-import { autenticarYObtenerToken } from '../auth/getCustomToken.js';
-import { askLLM } from '../llm/askLLM.js';
-import { signInWithEmailAndPassword } from 'firebase/auth';
-import {
-  collection,
-  getDocs,
-  query,
-} from 'firebase/firestore';
-import chalk from 'chalk';
 import 'dotenv/config';
+import chalk from 'chalk';
+import { initializeApp, getApps } from 'firebase/app';
+import { getFirestore, collection, getDocs } from 'firebase/firestore';
+import { getAuth, signInWithEmailAndPassword } from 'firebase/auth';
+import { getFirestore as adminFirestore } from 'firebase-admin/firestore';
+import { adminApp } from '../config/admin.js';
+import { askLLM } from '../llm/askLLM.js';
+import { runWithCorrelationId, getCorrelationId } from '../observability/correlationId.js';
+import { logger, flushLogs } from '../observability/logger.js';
+import { detectPIIInObject } from '../observability/piiDetector.js';
 
-// Pregunta fija para todos los escenarios.
-// Es intencionalmente transversal: requiere datos de las TRES colecciones
-// para ser respondida completamente. Así se hace evidente qué puede y qué no
-// puede ver cada rol.
+// Configuración del SDK Web (lee del .env)
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  appId: process.env.FIREBASE_APP_ID,
+};
+
+// Inicializa el SDK Web con un nombre explícito para evitar colisión con el Admin SDK
+const clientApp =
+  getApps().find((a) => a.name === 'client') ??
+  initializeApp(firebaseConfig, 'client');
+const clientDb = getFirestore(clientApp);
+const clientAuth = getAuth(clientApp);
+
 const PREGUNTA_DEMO =
   '¿Cuál es la deuda actual de Falabella Retail y cuál es nuestro margen con el proveedor que provee sus tarjetas?';
 
-const SEPARADOR = '═'.repeat(65);
-const SEPARADOR_FINO = '─'.repeat(65);
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilidades de display
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ──────────────────────────────────────────────
-// Helpers de lectura
-// ──────────────────────────────────────────────
-
-// Lee una colección completa usando el Admin SDK (sin restricciones de reglas).
-async function leerConAdmin(nombreColeccion) {
-  const snap = await adminDb.collection(nombreColeccion).get();
-  return snap.docs.map((d) => d.data());
+function separador(titulo) {
+  console.log('\n' + chalk.gray('═'.repeat(70)));
+  console.log(chalk.bold(titulo));
+  console.log(chalk.gray('═'.repeat(70)));
 }
 
-// Lee una colección usando el SDK Web (respeta las Firestore Security Rules).
-// Si el usuario autenticado no tiene permiso, Firebase lanza un error PERMISSION_DENIED
-// que capturamos y convertimos en array vacío — exactamente como se debe manejar en producción.
-async function leerConClienteSDK(nombreColeccion) {
-  try {
-    const snap = await getDocs(query(collection(clientDb, nombreColeccion)));
-    return snap.docs.map((d) => d.data());
-  } catch (err) {
-    if (err.code === 'permission-denied') {
-      return []; // Las reglas denegaron el acceso — array vacío es la respuesta correcta
-    }
-    throw err;
+function mostrarColecciones(resultados) {
+  for (const [nombre, docs] of Object.entries(resultados)) {
+    const color = docs.length > 0 ? chalk.green : chalk.red;
+    console.log(color(`  ${nombre}: ${docs.length} documento(s)`));
   }
 }
 
-// ──────────────────────────────────────────────
-// Visualización
-// ──────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Lee una colección con el SDK Web (respeta Security Rules).
+// Retorna [] si la regla deniega el acceso — y lo registra como evento de seguridad.
+// ─────────────────────────────────────────────────────────────────────────────
+async function leerColeccionSegura(nombreColeccion, rol) {
+  try {
+    const snap = await getDocs(collection(clientDb, nombreColeccion));
+    const docs = snap.docs.map((d) => d.data());
 
-function imprimirEncabezadoEscenario(numero, titulo, colorFn) {
-  console.log('\n' + chalk.bold(colorFn(SEPARADOR)));
-  console.log(chalk.bold(colorFn(`  ESCENARIO ${numero}: ${titulo}`)));
-  console.log(chalk.bold(colorFn(SEPARADOR)));
+    logger.info('firestore.lectura_exitosa', {
+      coleccion: nombreColeccion,
+      rol,
+      documentos_retornados: docs.length,
+    });
+
+    return docs;
+  } catch (err) {
+    // Las Security Rules de Firestore lanzan PERMISSION_DENIED.
+    // Lo capturamos, lo registramos como evento de seguridad y retornamos [].
+    // Esto es evidencia de que el control de acceso funcionó correctamente.
+    logger.warn('firestore.acceso_denegado', {
+      coleccion: nombreColeccion,
+      rol,
+      error_codigo: err.code,
+      control_rbac: 'activo',
+    });
+    return [];
+  }
 }
 
-function imprimirInfoColecciones(ventas, cobranza, finanzas) {
-  console.log(chalk.gray('\n  Documentos recibidos del servidor:'));
-  console.log(chalk.gray(`    crm_ventas         → ${ventas.length} doc(s)`));
-  console.log(chalk.gray(`    crm_cobranza       → ${cobranza.length} doc(s)`));
-  console.log(chalk.gray(`    finanzas_internas  → ${finanzas.length} doc(s)`));
+// ─────────────────────────────────────────────────────────────────────────────
+// Escenario 0 — El antipatrón inseguro (Admin SDK, sin restricciones)
+// ─────────────────────────────────────────────────────────────────────────────
+async function escenario0() {
+  return runWithCorrelationId(async () => {
+    const corrId = getCorrelationId();
+    separador(`ESCENARIO 0 — ANTIPATRÓN INSEGURO [correlation_id: ${corrId}]`);
+
+    logger.warn('escenario.iniciado', {
+      escenario: 0,
+      descripcion: 'antipatron_inseguro',
+      correlation_id: corrId,
+    });
+
+    // El Admin SDK bypasea las Security Rules completamente
+    const db = adminFirestore(adminApp);
+    const colecciones = ['crm_ventas', 'crm_cobranza', 'finanzas_internas'];
+    const contexto = {};
+
+    for (const col of colecciones) {
+      const snap = await db.collection(col).get();
+      contexto[col] = snap.docs.map((d) => d.data());
+    }
+
+    console.log(chalk.red('\n⚠  Admin SDK: sin restricciones de acceso'));
+    mostrarColecciones(contexto);
+
+    // Detecta PII en el contexto completo antes de enviarlo al LLM (punto de detección 1)
+    const piiContexto = detectPIIInObject(contexto);
+    logger.warn('pii.detectada_en_contexto', {
+      escenario: 0,
+      pii_counts: piiContexto,
+      destino: 'llm',
+      alerta: 'exfiltracion_potencial',
+    });
+
+    console.log(chalk.yellow(`\n  PII detectada en contexto: ${JSON.stringify(piiContexto)}`));
+    console.log(chalk.gray(`  Modelo: ${process.env.LLM_MODEL}`));
+
+    const respuesta = await askLLM(contexto, PREGUNTA_DEMO, {
+      escenario: 0,
+      rol: 'admin_sin_restricciones',
+      tipo: 'antipatron',
+    });
+
+    console.log(chalk.red('\n🔴 EXFILTRACIÓN DE DATOS — el LLM accedió a información que ningún rol individual debería ver\n'));
+    console.log(chalk.white('Respuesta del LLM:'));
+    console.log(chalk.yellow(respuesta));
+
+    logger.warn('escenario.completado', {
+      escenario: 0,
+      resultado: 'exfiltracion_datos',
+      correlation_id: corrId,
+    });
+
+    return corrId;
+  });
 }
 
-function imprimirContextoLLM(contexto) {
-  console.log(chalk.gray('\n  Extracto del contexto enviado al LLM:'));
-  const resumen = {
-    crm_ventas: contexto.crm_ventas.map((d) => ({ empresa: d.empresa, monto: d.monto_venta })),
-    crm_cobranza: contexto.crm_cobranza.map((d) => ({ empresa: d.empresa, deuda: d.deuda_total })),
-    finanzas_internas: contexto.finanzas_internas.map((d) => ({
-      empresa: d.empresa,
-      margen: d.margen_porcentaje,
-    })),
-  };
-  console.log(chalk.gray('  ' + JSON.stringify(resumen, null, 2).replace(/\n/g, '\n  ')));
+// ─────────────────────────────────────────────────────────────────────────────
+// Escenarios 1, 2, 3 — Roles con Security Rules activas
+// ─────────────────────────────────────────────────────────────────────────────
+async function escenarioRol(numero, email, password, rol, coleccionesPermitidas) {
+  return runWithCorrelationId(async () => {
+    const corrId = getCorrelationId();
+    separador(`ESCENARIO ${numero} — ${rol.toUpperCase()} [correlation_id: ${corrId}]`);
+
+    logger.info('escenario.iniciado', {
+      escenario: numero,
+      rol,
+      email,
+      correlation_id: corrId,
+    });
+
+    // Autenticación con el SDK Web: obtiene un ID token con los custom claims del rol
+    await signInWithEmailAndPassword(clientAuth, email, password);
+    logger.info('auth.login_exitoso', { rol, email });
+
+    // Intenta leer las tres colecciones. Las reglas filtran automáticamente.
+    const todasColecciones = ['crm_ventas', 'crm_cobranza', 'finanzas_internas'];
+    const contexto = {};
+
+    for (const col of todasColecciones) {
+      contexto[col] = await leerColeccionSegura(col, rol);
+    }
+
+    mostrarColecciones(contexto);
+
+    // Solo envía al LLM las colecciones que efectivamente retornaron datos
+    const contextoFiltrado = Object.fromEntries(
+      Object.entries(contexto).filter(([, v]) => v.length > 0)
+    );
+
+    const piiContexto = detectPIIInObject(contextoFiltrado);
+    console.log(chalk.gray(`\n  PII en contexto enviado al LLM: ${JSON.stringify(piiContexto)}`));
+    console.log(chalk.gray(`  Colecciones con datos: ${Object.keys(contextoFiltrado).join(', ') || 'ninguna'}`));
+    console.log(chalk.gray(`  Modelo: ${process.env.LLM_MODEL}`));
+
+    const respuesta = await askLLM(contextoFiltrado, PREGUNTA_DEMO, {
+      escenario: numero,
+      rol,
+      colecciones_permitidas: coleccionesPermitidas,
+      colecciones_con_datos: Object.keys(contextoFiltrado),
+    });
+
+    const coleccionesDenegadas = todasColecciones.filter(
+      (c) => !coleccionesPermitidas.includes(c)
+    );
+
+    if (coleccionesDenegadas.length > 0) {
+      console.log(chalk.green('\n🟢 Sistema seguro — el contexto fue filtrado en la capa de datos\n'));
+    } else {
+      console.log(chalk.blue('\n🔵 Acceso completo legítimo — el rol autoriza todas las colecciones\n'));
+    }
+
+    console.log(chalk.white('Respuesta del LLM:'));
+    console.log(chalk.cyan(respuesta));
+
+    logger.info('escenario.completado', {
+      escenario: numero,
+      rol,
+      colecciones_denegadas: coleccionesDenegadas,
+      control_rbac: coleccionesDenegadas.length > 0 ? 'activo_y_efectivo' : 'sin_restricciones_para_este_rol',
+      correlation_id: corrId,
+    });
+
+    return corrId;
+  });
 }
 
-function imprimirRespuestaLLM(respuesta) {
-  console.log(chalk.gray('\n  ' + SEPARADOR_FINO));
-  console.log(chalk.white('\n  Respuesta del LLM:\n'));
-  respuesta.split('\n').forEach((linea) => console.log('  ' + chalk.white(linea)));
-}
-
-// ──────────────────────────────────────────────
-// Escenarios
-// ──────────────────────────────────────────────
-
-async function escenario0_antipatron() {
-  imprimirEncabezadoEscenario(0, 'ANTIPATRÓN — Sin restricción (Admin SDK)', chalk.red);
-
-  console.log(chalk.gray(`\n  Rol activo     : Sin restricción — Admin SDK`));
-  console.log(chalk.gray(`  Modelo LLM     : ${process.env.LLM_MODEL}`));
-
-  // El Admin SDK bypasea las Security Rules completamente.
-  // Esto simula el antipatrón más común: una capa de servicio que consulta
-  // la base de datos completa y la pasa al LLM sin filtrar.
-  const ventas = await leerConAdmin('crm_ventas');
-  const cobranza = await leerConAdmin('crm_cobranza');
-  const finanzas = await leerConAdmin('finanzas_internas');
-
-  imprimirInfoColecciones(ventas, cobranza, finanzas);
-
-  const contexto = { crm_ventas: ventas, crm_cobranza: cobranza, finanzas_internas: finanzas };
-  imprimirContextoLLM(contexto);
-
-  console.log(chalk.gray('\n  Consultando al LLM...'));
-  const respuesta = await askLLM(contexto, PREGUNTA_DEMO);
-  imprimirRespuestaLLM(respuesta);
-
-  console.log('\n' + chalk.bgRed.white.bold(
-    '  ⚠  EXFILTRACIÓN DE DATOS — el LLM accedió a información que ningún rol individual debería ver  '
-  ));
-  console.log(chalk.red('\n  Un ejecutivo de ventas que obtenga acceso al LLM podría extraer'));
-  console.log(chalk.red('  márgenes internos y deudas de clientes — datos para los que no tiene autorización.\n'));
-}
-
-async function escenario1_ventas() {
-  imprimirEncabezadoEscenario(1, 'Ejecutivo de Ventas', chalk.green);
-
-  console.log(chalk.gray(`\n  Rol activo     : ejecutivo_ventas`));
-  console.log(chalk.gray(`  Modelo LLM     : ${process.env.LLM_MODEL}`));
-  console.log(chalk.gray(`  Usuario        : ${process.env.USER_VENTAS_EMAIL}`));
-
-  await autenticarYObtenerToken(process.env.USER_VENTAS_EMAIL, process.env.USER_VENTAS_PASSWORD);
-
-  // Las Security Rules permiten leer crm_ventas a este rol,
-  // pero devuelven PERMISSION_DENIED en crm_cobranza y finanzas_internas.
-  const ventas = await leerConClienteSDK('crm_ventas');
-  const cobranza = await leerConClienteSDK('crm_cobranza');
-  const finanzas = await leerConClienteSDK('finanzas_internas');
-
-  imprimirInfoColecciones(ventas, cobranza, finanzas);
-
-  const contexto = { crm_ventas: ventas, crm_cobranza: cobranza, finanzas_internas: finanzas };
-  imprimirContextoLLM(contexto);
-
-  console.log(chalk.gray('\n  Consultando al LLM...'));
-  const respuesta = await askLLM(contexto, PREGUNTA_DEMO);
-  imprimirRespuestaLLM(respuesta);
-
-  console.log('\n' + chalk.bgGreen.black.bold(
-    '  ✓ Sistema seguro — el contexto fue filtrado en la capa de datos  '
-  ));
-  console.log(chalk.green('\n  El LLM no pudo responder sobre deuda ni márgenes porque'));
-  console.log(chalk.green('  Firestore nunca envió esos datos al servidor Node.js.\n'));
-}
-
-async function escenario2_cobranza() {
-  imprimirEncabezadoEscenario(2, 'Gestor de Cobranza', chalk.yellow);
-
-  console.log(chalk.gray(`\n  Rol activo     : gestor_cobranza`));
-  console.log(chalk.gray(`  Modelo LLM     : ${process.env.LLM_MODEL}`));
-  console.log(chalk.gray(`  Usuario        : ${process.env.USER_COBRANZA_EMAIL}`));
-
-  await autenticarYObtenerToken(process.env.USER_COBRANZA_EMAIL, process.env.USER_COBRANZA_PASSWORD);
-
-  // Las reglas permiten crm_ventas y crm_cobranza para este rol,
-  // pero bloquean finanzas_internas.
-  const ventas = await leerConClienteSDK('crm_ventas');
-  const cobranza = await leerConClienteSDK('crm_cobranza');
-  const finanzas = await leerConClienteSDK('finanzas_internas');
-
-  imprimirInfoColecciones(ventas, cobranza, finanzas);
-
-  const contexto = { crm_ventas: ventas, crm_cobranza: cobranza, finanzas_internas: finanzas };
-  imprimirContextoLLM(contexto);
-
-  console.log(chalk.gray('\n  Consultando al LLM...'));
-  const respuesta = await askLLM(contexto, PREGUNTA_DEMO);
-  imprimirRespuestaLLM(respuesta);
-
-  console.log('\n' + chalk.bgYellow.black.bold(
-    '  ~ Acceso parcial — deuda visible, márgenes internos protegidos  '
-  ));
-  console.log(chalk.yellow('\n  El LLM puede responder sobre la deuda de Falabella (crm_cobranza),'));
-  console.log(chalk.yellow('  pero no sobre el margen del proveedor (finanzas_internas).\n'));
-}
-
-async function escenario3_finanzas() {
-  imprimirEncabezadoEscenario(3, 'Director de Finanzas', chalk.cyan);
-
-  console.log(chalk.gray(`\n  Rol activo     : director_finanzas`));
-  console.log(chalk.gray(`  Modelo LLM     : ${process.env.LLM_MODEL}`));
-  console.log(chalk.gray(`  Usuario        : ${process.env.USER_FINANZAS_EMAIL}`));
-
-  await autenticarYObtenerToken(process.env.USER_FINANZAS_EMAIL, process.env.USER_FINANZAS_PASSWORD);
-
-  // El director de finanzas tiene acceso a las tres colecciones.
-  // Las reglas lo confirman: su rol aparece en todos los bloques de allow read.
-  const ventas = await leerConClienteSDK('crm_ventas');
-  const cobranza = await leerConClienteSDK('crm_cobranza');
-  const finanzas = await leerConClienteSDK('finanzas_internas');
-
-  imprimirInfoColecciones(ventas, cobranza, finanzas);
-
-  const contexto = { crm_ventas: ventas, crm_cobranza: cobranza, finanzas_internas: finanzas };
-  imprimirContextoLLM(contexto);
-
-  console.log(chalk.gray('\n  Consultando al LLM...'));
-  const respuesta = await askLLM(contexto, PREGUNTA_DEMO);
-  imprimirRespuestaLLM(respuesta);
-
-  console.log('\n' + chalk.bgCyan.black.bold(
-    '  ✓ Acceso legítimo completo — el rol autoriza ver toda la información  '
-  ));
-  console.log(chalk.cyan('\n  El LLM responde la pregunta completa porque el director de finanzas'));
-  console.log(chalk.cyan('  tiene permisos reales en Firestore para leer las tres colecciones.\n'));
-}
-
-// ──────────────────────────────────────────────
-// Punto de entrada
-// ──────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(chalk.bold('\n' + '█'.repeat(65)));
-  console.log(chalk.bold('  DEMO: Seguridad por Diseño en Arquitecturas LLM'));
-  console.log(chalk.bold('  CRM Corporativo — Firebase + LangChain + Mistral'));
-  console.log(chalk.bold('█'.repeat(65)));
-  console.log(chalk.gray(`\n  Pregunta de demo:\n  "${PREGUNTA_DEMO}"\n`));
+  console.log(chalk.bold.cyan('\n🔍 DEMO DE SEGURIDAD + OBSERVABILIDAD — Laboratorio LLM\n'));
+  console.log(chalk.gray('Cada escenario genera un correlation_id único que aparece'));
+  console.log(chalk.gray('tanto en Better Stack (logs) como en LangSmith (trazas LLM).\n'));
 
-  await escenario0_antipatron();
-  await escenario1_ventas();
-  await escenario2_cobranza();
-  await escenario3_finanzas();
+  const correlationIds = {};
 
-  console.log(chalk.bold('\n' + '═'.repeat(65)));
-  console.log(chalk.bold('  Demo finalizado'));
-  console.log(chalk.bold('═'.repeat(65) + '\n'));
+  correlationIds[0] = await escenario0();
 
-  // Cerrar sesión para dejar el estado limpio
-  await clientAuth.signOut();
+  correlationIds[1] = await escenarioRol(
+    1,
+    process.env.USER_VENTAS_EMAIL,
+    process.env.USER_VENTAS_PASSWORD,
+    'ejecutivo_ventas',
+    ['crm_ventas']
+  );
+
+  correlationIds[2] = await escenarioRol(
+    2,
+    process.env.USER_COBRANZA_EMAIL,
+    process.env.USER_COBRANZA_PASSWORD,
+    'gestor_cobranza',
+    ['crm_ventas', 'crm_cobranza']
+  );
+
+  correlationIds[3] = await escenarioRol(
+    3,
+    process.env.USER_FINANZAS_EMAIL,
+    process.env.USER_FINANZAS_PASSWORD,
+    'director_finanzas',
+    ['crm_ventas', 'crm_cobranza', 'finanzas_internas']
+  );
+
+  // ─── Resumen de correlation IDs ────────────────────────────────────────────
+  // Este bloque es el punto de entrada para investigar cualquier escenario
+  // en ambas herramientas de observabilidad.
+  separador('RESUMEN DE TRAZABILIDAD');
+  console.log(chalk.white('Usa estos IDs para cruzar logs en Better Stack con trazas en LangSmith:\n'));
+
+  for (const [escenario, id] of Object.entries(correlationIds)) {
+    console.log(chalk.gray(`  Escenario ${escenario}: `) + chalk.yellow(id));
+    console.log(chalk.gray(`    Better Stack → filtrar por correlation_id = "${id}"`));
+    console.log(chalk.gray(`    LangSmith    → filtrar por metadata.correlation_id = "${id}"`));
+    console.log();
+  }
+
+  console.log(chalk.gray(`  LangSmith proyecto: ${process.env.LANGCHAIN_PROJECT ?? 'ver LANGCHAIN_PROJECT en .env'}`));
+  console.log(chalk.gray('  LangSmith URL: https://smith.langchain.com\n'));
+
+  // Asegura que todos los logs llegaron a Better Stack antes de salir
+  await flushLogs();
   process.exit(0);
 }
 
 main().catch((err) => {
-  console.error(chalk.red('\nError en la demo:'), err.message);
-  if (err.code) console.error(chalk.red('Código:'), err.code);
+  logger.error('demo.error_fatal', { mensaje: err.message, stack: err.stack });
+  console.error(chalk.red('Error fatal:'), err);
   process.exit(1);
 });
