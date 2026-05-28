@@ -153,3 +153,64 @@ Objetivo: demostrar la abstracción de LangChain — la lógica de seguridad en 
 - El script demora ~30-60 segundos dependiendo de la latencia de Mistral. Normal.
 - Si un escenario falla por timeout de red, se puede ejecutar individualmente modificando `runDemo.js` para comentar los demás escenarios.
 - Los datos del seed son consistentes entre colecciones — la empresa `Falabella Retail S.A.` aparece en las tres con el mismo `cliente_id: CLI-002`. Esto hace que la pregunta del demo tenga respuesta real y verificable.
+
+---
+
+## Parte 2: Observabilidad del sistema LLM
+
+### Propósito pedagógico de esta extensión
+
+Esta segunda parte conecta el laboratorio de seguridad con el concepto de
+**observabilidad orientada a seguridad**. El objetivo no es solo que el sistema
+sea seguro, sino que podamos *demostrar* que es seguro, rastrear cuándo un
+control actúa, y conectar el comportamiento del modelo con el del backend.
+
+### Lo que el alumno debe ver en cada herramienta
+
+**En LangSmith** (después de ejecutar el demo):
+1. Cuatro runs, uno por escenario
+2. Cada run tiene `metadata.rol`, `metadata.escenario`, `metadata.correlation_id`
+3. El run del escenario 0 tiene el prompt más largo (tres colecciones completas)
+4. Los runs de los escenarios 1 y 2 muestran cómo varía el contexto enviado al modelo
+5. Todos tienen `temperature: 0` → respuestas deterministas y reproducibles
+
+**En Better Stack** (después de ejecutar el demo):
+1. Eventos `escenario.iniciado` y `escenario.completado` para cada escenario
+2. Eventos `firestore.acceso_denegado` en los escenarios 1 y 2 (evidencia del RBAC)
+3. Eventos `llm.invocacion_completada` con el conteo de PII en la respuesta del escenario 0
+4. El mismo `correlation_id` presente en todos los eventos de un mismo escenario
+
+### Puntos clave para destacar durante la demo
+
+- **Correlación entre herramientas**: copiar un `correlation_id` del resumen final
+  y buscarlo en ambas herramientas demuestra en vivo el valor del patrón.
+- **Minimización de datos**: los logs registran `pii_en_respuesta: {email: 1, rut: 2}`,
+  no los valores reales. Preguntar al alumno: ¿por qué importa esto?
+- **AsyncLocalStorage como contextvars**: el `correlation_id` no se pasa como argumento
+  a ninguna función. Revisar el código de `correlationId.js` para que el alumno
+  vea el mecanismo.
+- **PII en tres puntos**: input al LLM, output del LLM, y (potencialmente) contexto RAG.
+  En este laboratorio solo hay input y output; un sistema RAG real agrega el punto intermedio.
+
+### Preguntas sugeridas para discusión
+
+1. ¿Qué pasaría si alguien comprometiera la plataforma de Better Stack?
+   ¿Qué datos sensibles estarían expuestos con esta implementación?
+   (Respuesta esperada: solo conteos de PII, no el contenido real.)
+
+2. ¿Por qué LangSmith y Better Stack son herramientas separadas y no una sola?
+   ¿Qué observa cada una que la otra no puede ver?
+
+3. Si el escenario 0 fuera una llamada real de producción, ¿cómo usarías
+   el `correlation_id` para investigar el incidente?
+
+4. ¿Por qué se usa `AsyncLocalStorage` en lugar de pasar el `correlation_id`
+   como parámetro en cada función?
+
+### Extensión de tarea sugerida
+
+- Agregar detección de anomalías: si un mismo `user_id` hace más de 10 llamadas
+  en 60 segundos, loggear un evento `anomalia.volumen_excesivo` con nivel `warn`.
+- Configurar una alerta en Better Stack que se dispare cuando aparezca ese evento.
+- Agregar un cuarto punto de detección de PII: el texto de la pregunta del usuario
+  antes de enviarlo al LLM.
